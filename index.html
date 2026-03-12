@@ -257,6 +257,7 @@
   }
   .badge-epub  { background: rgba(74,103,165,0.12); color: #7ba4f0; border-color: rgba(74,103,165,0.28); }
   .badge-pdf   { background: rgba(155,58,31,0.12); color: #e08070; border-color: rgba(155,58,31,0.28); }
+  .badge-mobi  { background: rgba(80,140,80,0.12);  color: #82c882; border-color: rgba(80,140,80,0.28); }
   .badge-reading { background: rgba(74,165,74,0.12); color: #7adda6; border-color: rgba(74,165,74,0.28); }
   .badge-done    { background: rgba(200,137,58,0.12); color: var(--amber-light); border-color: rgba(200,137,58,0.28); }
   .badge-paused  { background: rgba(165,130,74,0.08); color: rgba(232,185,106,0.55); border-color: rgba(200,137,58,0.15); }
@@ -1122,7 +1123,7 @@
 
 <main>
   <div id="upload-zone">
-    <input type="file" id="file-input" accept=".epub,.pdf" multiple>
+    <input type="file" id="file-input" accept=".epub,.pdf,.mobi" multiple>
     <div class="upload-icon">📚</div>
     <div class="upload-text">Arrastra tus libros aquí</div>
     <div class="upload-sub">EPUB y PDF · o haz clic para seleccionar</div>
@@ -1953,6 +1954,266 @@ async function parsePdf(file) {
 }
 
 // ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════
+// MOBI PARSER
+// ═══════════════════════════════════════════════
+
+// Decompress a PalmDOC-compressed record (returns Uint8Array)
+function _palmDocDecompress(data) {
+  const out = [];
+  let i = 0;
+  while (i < data.length) {
+    const c = data[i++];
+    if      (c === 0)        { out.push(0); }
+    else if (c <= 8)         { for (let j = 0; j < c && i < data.length; j++) out.push(data[i++]); }
+    else if (c <= 0x7F)      { out.push(c); }
+    else if (c <= 0xBF) {
+      const c2  = i < data.length ? data[i++] : 0;
+      const val  = (c << 8) | c2;
+      const dist = (val >> 3) & 0x7FF;
+      const len  = (val & 7) + 3;
+      const pos  = out.length - dist;
+      for (let j = 0; j < len; j++) out.push(pos + j >= 0 ? (out[pos + j] || 32) : 32);
+    } else { out.push(32); out.push(c ^ 0x80); }
+  }
+  return new Uint8Array(out);
+}
+
+// Strip one trailing entry (variable-length size at end of record)
+function _mobiStripTrail(data) {
+  if (data.length < 4) return data;
+  const tail = data.slice(-4);
+  let size = 0;
+  for (let i = 0; i < 4; i++) {
+    const v = tail[i];
+    if (v & 0x80) size = 0;        // reset accumulator on high-bit byte
+    size = (size << 7) | (v & 0x7F);
+  }
+  if (size <= 0 || size >= data.length) return data;
+  return data.slice(0, data.length - size);
+}
+
+// Decode a MOBI binary buffer → { title, author, html, cover? }
+function _decodeMobi(ba, buf) {
+  const dv   = new DataView(buf);
+  const u32  = o => dv.getUint32(o, false);
+  const u16  = o => dv.getUint16(o, false);
+  const s8   = (o, l) => new TextDecoder('latin1').decode(ba.slice(o, o + l)).replace(/\0/g, '');
+
+  // Validate PalmDB type/creator
+  if (s8(60, 4) !== 'BOOK' || s8(64, 4) !== 'MOBI')
+    throw new Error('No es un archivo MOBI (cabecera PalmDB inválida)');
+
+  const nRecs = u16(76);
+  const rOff  = i => u32(78 + i * 8);  // record offset in file
+
+  // Record 0: PalmDOC header (16 bytes) + MOBI header
+  const R0          = rOff(0);
+  const compression = u16(R0 + 0);   // 1=none, 2=PalmDOC, 17480=Huffman
+  const nTextRecs   = u16(R0 + 8);
+
+  if (compression !== 1 && compression !== 2)
+    throw new Error('Compresión MOBI no soportada (tipo ' + compression + '). Solo PalmDOC/sin compresión.');
+
+  // MOBI header starts 16 bytes into record 0
+  const MH = R0 + 16;
+  if (s8(MH, 4) !== 'MOBI') throw new Error('Header MOBI no encontrado');
+
+  const mhLen   = u32(MH + 4);
+  const encCode = u32(MH + 12);   // 65001=UTF-8, 1252=Windows-1252
+  const charset = encCode === 65001 ? 'utf-8' : 'windows-1252';
+  const dec     = new TextDecoder(charset);
+
+  // Full-name: try two known offset variants (different MOBI format revisions)
+  let title = s8(0, 32); // fallback: PalmDB title
+  for (const [dOff, dLen] of [[MH + 60, MH + 64], [MH + 68, MH + 72]]) {
+    try {
+      const off = u32(dOff), len = u32(dLen);
+      if (len > 0 && len < 2000 && R0 + off + len <= buf.byteLength) {
+        const cand = dec.decode(ba.slice(R0 + off, R0 + off + len)).trim();
+        if (cand && cand.length > 0) { title = cand; break; }
+      }
+    } catch(e) {}
+  }
+
+  // EXTH block for author + cover record index
+  let author = '', coverRecordIdx = -1;
+  const exthStart = MH + mhLen;
+  if (exthStart + 12 <= buf.byteLength && s8(exthStart, 4) === 'EXTH') {
+    const nExth = u32(exthStart + 8);
+    let p = exthStart + 12;
+    for (let i = 0; i < nExth && p + 8 <= buf.byteLength; i++) {
+      const t = u32(p), l = u32(p + 4);
+      if (l < 8 || l > 65536) break;
+      if (t === 100) author = new TextDecoder('utf-8').decode(ba.slice(p + 8, p + l)).trim();
+      if (t === 201 && l === 12) coverRecordIdx = dv.getInt32(p + 8, false); // cover offset
+      p += l;
+    }
+  }
+
+  // Extra-data flags → trailing bytes per text record
+  let multiOverlap = false, trailFlags = 0;
+  if (mhLen >= 228 && MH + 228 <= buf.byteLength) {
+    const edf    = u16(MH + 226);
+    multiOverlap = (edf & 1) !== 0;
+    trailFlags   = edf >> 1;
+  }
+
+  // First image record index (for cover fallback)
+  let firstImgRec = 0xFFFFFFFF;
+  if (mhLen >= 88) {
+    const fi = u32(MH + 84);  // MOBI header offset 84
+    if (fi > 0 && fi < nRecs) firstImgRec = fi;
+  }
+
+  // Decompress text records
+  const parts = [];
+  for (let i = 1; i <= nTextRecs && i < nRecs; i++) {
+    const start = rOff(i);
+    const end   = i + 1 < nRecs ? rOff(i + 1) : buf.byteLength;
+    let   data  = ba.slice(start, end);
+
+    // Strip trailing entries (bits 1..15 of trailFlags)
+    let f = trailFlags;
+    while (f > 0) { if (f & 1) data = _mobiStripTrail(data); f >>>= 1; }
+    // Strip multibyte overlap (bit 0)
+    if (multiOverlap && data.length > 0) {
+      const over = (data[data.length - 1] & 3) + 1;
+      if (over < data.length) data = data.slice(0, data.length - over);
+    }
+
+    parts.push(compression === 2 ? _palmDocDecompress(data) : data);
+  }
+
+  // Concatenate decompressed parts
+  const total    = parts.reduce((s, p) => s + p.length, 0);
+  const combined = new Uint8Array(total);
+  let   pos      = 0;
+  for (const p of parts) { combined.set(p, pos); pos += p.length; }
+
+  const html = dec.decode(combined);
+
+  // Try to extract cover image
+  let cover = null;
+  const covIdx = coverRecordIdx >= 0 && firstImgRec !== 0xFFFFFFFF
+    ? firstImgRec + coverRecordIdx
+    : firstImgRec;
+  if (covIdx !== 0xFFFFFFFF && covIdx > 0 && covIdx < nRecs) {
+    try {
+      const is = rOff(covIdx);
+      const ie = covIdx + 1 < nRecs ? rOff(covIdx + 1) : buf.byteLength;
+      const id = ba.slice(is, ie);
+      const isJpg = id[0] === 0xFF && id[1] === 0xD8;
+      const isPng = id[0] === 0x89 && id[1] === 0x50;
+      const isGif = id[0] === 0x47 && id[1] === 0x49;
+      if ((isJpg || isPng || isGif) && id.length > 100) {
+        const mime = isJpg ? 'image/jpeg' : isPng ? 'image/png' : 'image/gif';
+        let b64 = '';
+        // Build base64 in chunks to avoid call-stack limits
+        for (let k = 0; k < id.length; k += 8192) {
+          b64 += String.fromCharCode.apply(null, id.slice(k, k + 8192));
+        }
+        cover = 'data:' + mime + ';base64,' + btoa(b64);
+      }
+    } catch(e) {}
+  }
+
+  return { title: title.trim(), author: author.trim(), html, cover };
+}
+
+// Split MOBI HTML into chapters
+function _splitMobiHtml(rawHtml) {
+  // Sanitise MOBI-specific elements
+  const cleaned = rawHtml
+    .replace(/<mbp:pagebreak\s*\/?>/gi, '<hr class="mobi-pb"/>')
+    .replace(/<\/?[a-zA-Z]+:[a-zA-Z][^>]*>/g, '');  // strip namespace tags
+
+  const parser = new DOMParser();
+  const doc    = parser.parseFromString('<html><body>' + cleaned + '</body></html>', 'text/html');
+  const body   = doc.body;
+  if (!body || !body.innerHTML.trim()) return [{ href: 'ch0', html: cleaned }];
+
+  // Helper: flush accumulated nodes into a chapter
+  function flush(nodes, chaps) {
+    if (!nodes.length) return;
+    const d = document.createElement('div');
+    nodes.forEach(n => d.appendChild(n.cloneNode(true)));
+    if (d.textContent.trim().length > 30)
+      chaps.push({ href: 'ch' + chaps.length, html: d.innerHTML });
+  }
+
+  // Strategy 1 — split at H1/H2 headings (2+ headings required)
+  const heads = body.querySelectorAll('h1, h2');
+  if (heads.length >= 2) {
+    const chaps = []; let buf = [];
+    for (const node of Array.from(body.childNodes)) {
+      if (node.nodeType === 1 && (node.tagName === 'H1' || node.tagName === 'H2')) flush(buf, chaps), buf = [];
+      buf.push(node);
+    }
+    flush(buf, chaps);
+    if (chaps.length >= 2) return chaps;
+  }
+
+  // Strategy 2 — split at <hr class="mobi-pb"> page-break markers
+  const pbs = body.querySelectorAll('hr.mobi-pb');
+  if (pbs.length >= 2) {
+    const chaps = []; let buf = [];
+    for (const node of Array.from(body.childNodes)) {
+      if (node.nodeType === 1 && node.classList && node.classList.contains('mobi-pb'))
+        { flush(buf, chaps); buf = []; }
+      else buf.push(node);
+    }
+    flush(buf, chaps);
+    if (chaps.length >= 2) return chaps;
+  }
+
+  // Strategy 3 — word-count chunks (~5 000 words each) for flat books
+  const fullHtml  = body.innerHTML;
+  const wordCount = fullHtml.split(/\s+/).length;
+  if (wordCount <= 6000) return [{ href: 'ch0', html: fullHtml }];
+
+  const chaps = []; let cur = '', wc = 0;
+  for (const frag of fullHtml.split(/(?<=<\/p>|<br\s*\/?>)/gi)) {
+    const fw = frag.split(/\s+/).length;
+    if (wc + fw > 5000 && cur.trim()) { chaps.push({ href: 'ch' + chaps.length, html: cur }); cur = ''; wc = 0; }
+    cur += frag; wc += fw;
+  }
+  if (cur.trim()) chaps.push({ href: 'ch' + chaps.length, html: cur });
+  return chaps.length ? chaps : [{ href: 'ch0', html: fullHtml }];
+}
+
+async function parseMobi(file) {
+  try {
+    showNotification('📖 Procesando MOBI…');
+    const buf = await file.arrayBuffer();
+    const ba  = new Uint8Array(buf);
+    const { title, author, html, cover } = _decodeMobi(ba, buf);
+
+    const chapters = _splitMobiHtml(html);
+    if (!chapters.length) { showNotification('No se pudo extraer texto del MOBI'); return; }
+
+    const id   = genId();
+    const book = {
+      id, format: 'mobi', name: file.name,
+      title:  title  || file.name.replace(/\.mobi$/i, '').replace(/[-_]/g, ' '),
+      author: author || 'Desconocido',
+      subject: '', description: '',
+      year: '', tags: [], rating: 0, status: 'unread',
+      series: '', seriesIndex: '',
+      chapters, toc: [], addedAt: Date.now()
+    };
+    if (cover) book.cover = cover;
+    books.push(book);
+    saveBooks();
+    renderCatalog();
+    showNotification('📚 "' + book.title + '" agregado (' + chapters.length + ' capítulo' + (chapters.length !== 1 ? 's' : '') + ')');
+  } catch(e) {
+    console.error('MOBI parse error:', e);
+    showNotification('Error al procesar MOBI: ' + (e.message || 'formato no reconocido'));
+  }
+}
+
+// ═══════════════════════════════════════════════
 // FILE HANDLING
 // ═══════════════════════════════════════════════
 async function handleFiles(files) {
@@ -1964,6 +2225,7 @@ async function handleFiles(files) {
     const lc = file.name.toLowerCase();
     if      (lc.endsWith('.epub')) await parseEpub(file);
     else if (lc.endsWith('.pdf'))  await parsePdf(file);
+    else if (lc.endsWith('.mobi')) await parseMobi(file);
     else showNotification('Formato no soportado: ' + file.name);
   }
 }
@@ -2109,7 +2371,7 @@ function makeBookCard(book) {
       '<div class="book-card-title">' + book.title + '</div>' +
       '<div class="book-card-author">' + book.author + '</div>' +
       '<div class="book-badges">' +
-        '<span class="badge ' + (book.format === 'pdf' ? 'badge-pdf' : 'badge-epub') + '">' + book.format.toUpperCase() + '</span>' +
+        '<span class="badge badge-' + book.format + '">' + book.format.toUpperCase() + '</span>' +
         statusBadge(book.status) +
       '</div>' +
       (book.rating ? '<div class="book-stars">' + starsHtml(book.rating) + '</div>' : '') +
@@ -2143,7 +2405,7 @@ function makeBookRow(book) {
       '<div class="row-title">' + book.title + '</div>' +
       '<div class="row-author">' + book.author + '</div>' +
       '<div class="row-meta">' +
-        '<span class="badge ' + (book.format === 'pdf' ? 'badge-pdf' : 'badge-epub') + '">' + book.format.toUpperCase() + '</span>' +
+        '<span class="badge badge-' + book.format + '">' + book.format.toUpperCase() + '</span>' +
         statusBadge(book.status) +
         (book.rating ? '<span class="book-stars">' + starsHtml(book.rating) + '</span>' : '') +
       '</div>' +
