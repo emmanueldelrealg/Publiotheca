@@ -492,6 +492,9 @@
   .search-highlight.current { background: rgba(200,137,58,0.6); }
   .tts-word { border-radius: 2px; padding: 0 1px; cursor: default; transition: background 0.06s; }
   .tts-word.tts-speaking { background: rgba(74,103,165,0.28); outline: 1px solid rgba(74,103,165,0.48); }
+  .tts-word.tts-sentence-active { background: rgba(74,103,165,0.13); border-radius: 2px; }
+  .tts-word.search-highlight { background: rgba(232,185,106,0.4); border-radius: 2px; }
+  .tts-word.search-highlight.search-current { background: rgba(200,137,58,0.7); outline: 1px solid rgba(200,137,58,0.9); }
   .hl-span { border-radius: 2px; cursor: pointer; padding: 0 1px; }
   .hl-yellow { background: rgba(232,185,106,0.26); border-bottom: 1.5px solid rgba(232,185,106,0.55); }
   .hl-green  { background: rgba(74,165,74,0.2);  border-bottom: 1.5px solid rgba(74,165,74,0.55); }
@@ -2937,14 +2940,22 @@ _on('font-up',   'click', () => { fontSize = Math.min(36, fontSize + 2); const r
 // ═══════════════════════════════════════════════
 // READER SEARCH
 // ═══════════════════════════════════════════════
+function _clearSearchHighlights() {
+  const rc = document.getElementById('reader-content');
+  if (!rc) return;
+  rc.querySelectorAll('.tts-word.search-highlight').forEach(s => {
+    s.classList.remove('search-highlight', 'search-current');
+  });
+  // Also clean up any legacy <mark> elements from older code
+  rc.querySelectorAll('mark.search-highlight').forEach(el => {
+    if (el.parentNode) { el.parentNode.replaceChild(document.createTextNode(el.textContent), el); }
+  });
+}
+
 function closeReaderSearch() {
   const bar = document.getElementById('reader-search-bar');
   if (bar) bar.style.display = 'none';
-  const rc = document.getElementById('reader-content');
-  if (rc) rc.querySelectorAll('.search-highlight').forEach(el => {
-    const parent = el.parentNode;
-    if (parent) { parent.replaceChild(document.createTextNode(el.textContent), el); parent.normalize(); }
-  });
+  _clearSearchHighlights();
   searchResults = []; searchIdx = -1;
   const cnt = document.getElementById('reader-search-count');
   if (cnt) cnt.textContent = '';
@@ -2956,54 +2967,30 @@ function doSearch() {
   const rc  = document.getElementById('reader-content');
   if (!rc) return;
 
-  // Clear old highlights, normalize once at the end
-  rc.querySelectorAll('.search-highlight').forEach(el => {
-    if (el.parentNode) el.parentNode.replaceChild(document.createTextNode(el.textContent), el);
-  });
-  rc.normalize();
+  _clearSearchHighlights();
   searchResults = []; searchIdx = -1;
-  if (!q) { const cnt = document.getElementById('reader-search-count'); if (cnt) cnt.textContent = ''; return; }
+  const cnt = document.getElementById('reader-search-count');
+  if (!q) { if (cnt) cnt.textContent = ''; return; }
 
-  // Walk text nodes — find ALL occurrences per node
-  function walk(node) {
-    if (node.nodeType === 3) {
-      const text   = node.textContent;
-      const lower  = text.toLowerCase();
-      const qLower = q.toLowerCase();
-      let start = 0, offset;
-      const parts = [];
-      while ((offset = lower.indexOf(qLower, start)) !== -1) {
-        if (offset > start) parts.push(document.createTextNode(text.slice(start, offset)));
-        const mark       = document.createElement('mark');
-        mark.className   = 'search-highlight';
-        mark.textContent = text.slice(offset, offset + q.length);
-        parts.push(mark);
-        start = offset + q.length;
-      }
-      if (!parts.length) return;
-      if (start < text.length) parts.push(document.createTextNode(text.slice(start)));
-      const parent = node.parentNode;
-      if (!parent) return;
-      parts.forEach(p => parent.insertBefore(p, node));
-      parent.removeChild(node);
-      parts.forEach(p => { if (p.nodeType === 1) searchResults.push(p); });
-    } else if (node.nodeType === 1 && !['SCRIPT','STYLE'].includes(node.tagName)) {
-      Array.from(node.childNodes).forEach(walk);
+  const qLower = q.toLowerCase();
+
+  // Search within individual .tts-word spans (each span = one word token)
+  const spans = Array.from(rc.querySelectorAll('.tts-word'));
+  spans.forEach(span => {
+    if (span.textContent.toLowerCase().includes(qLower)) {
+      span.classList.add('search-highlight');
+      searchResults.push(span);
     }
-  }
-  Array.from(rc.childNodes).forEach(child => {
-    const loading = document.getElementById('reader-loading');
-    const ribbon  = document.getElementById('reader-ribbon');
-    if (child !== loading && child !== ribbon) walk(child);
   });
 
-  const cnt = document.getElementById('reader-search-count');
   if (cnt) cnt.textContent = searchResults.length + ' resultado' + (searchResults.length !== 1 ? 's' : '');
   if (searchResults.length) { searchIdx = 0; highlightSearchCurrent(); }
 }
 
 function highlightSearchCurrent() {
-  searchResults.forEach((el, i) => el.classList.toggle('current', i === searchIdx));
+  searchResults.forEach((el, i) => {
+    el.classList.toggle('search-current', i === searchIdx);
+  });
   if (searchIdx >= 0 && searchResults[searchIdx]) {
     searchResults[searchIdx].scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
@@ -3201,27 +3188,52 @@ _on('sel-note-btn', 'click', () => {
 });
 
 // ═══════════════════════════════════════════════
-// READER TTS — single utterance per chapter, Chrome keepalive
+// READER TTS — sentence-by-sentence, no inter-word gaps
+// Each sentence is one utterance; chained via onend (no synth.cancel between sentences).
+// Short sentences stay well under Chrome's ~15s auto-stop limit.
 // ═══════════════════════════════════════════════
-let readerTtsUtterance = null, _readerTtsGen = 0, _readerTtsKA = null;
+let _readerTtsGen = 0;
+// Sentence list for current TTS session: [{words:[span,...], text:string, startWordIdx:int}]
+let _ttsSentences = [], _ttsSentIdx = 0;
 
-function _clearReaderKA() { if (_readerTtsKA) { clearInterval(_readerTtsKA); _readerTtsKA = null; } }
+function _clearTtsSentenceHighlight() {
+  const rc = document.getElementById('reader-content');
+  if (!rc) return;
+  rc.querySelectorAll('.tts-word.tts-sentence-active, .tts-word.tts-speaking')
+    .forEach(el => el.classList.remove('tts-sentence-active', 'tts-speaking'));
+}
+
+// Build sentence groups from .tts-word spans starting at span index `fromWordIdx`.
+// A sentence ends on a span whose text ends with . ? ! (optionally followed by " or ').
+function _buildTtsSentences(words, fromWordIdx) {
+  const sentences = [];
+  let cur = { words: [], text: '', startWordIdx: fromWordIdx };
+  for (let i = fromWordIdx; i < words.length; i++) {
+    const w = words[i];
+    const t = w.textContent;
+    cur.words.push(w);
+    cur.text += (cur.text ? ' ' : '') + t;
+    if (/[.?!]['"»]?\s*$/.test(t) || cur.words.length >= 40) {
+      sentences.push(cur);
+      cur = { words: [], text: '', startWordIdx: i + 1 };
+    }
+  }
+  if (cur.words.length) sentences.push(cur);
+  return sentences;
+}
 
 function ttsStopReaderMode() {
   if (!readerTtsActive) return;
-  // Unified bookmark: save current word as both rsvpWordIndex and scrollRatio
+  // Unified bookmark
   if (currentBook && readerTtsCurrent >= 0 && readerTtsWords.length > 0) {
     const scrollRatio = readerTtsCurrent / Math.max(1, readerTtsWords.length - 1);
     saveBm({ rsvpWordIndex: readerTtsCurrent, scrollRatio, chapterIndex: currentChapterIndex });
   }
   _readerTtsGen++;
-  _clearReaderKA();
   readerTtsActive = false;
-  readerTtsUtterance = null;
   synth.cancel();
   readerTtsCurrent = -1;
-  const rc = document.getElementById('reader-content');
-  if (rc) rc.querySelectorAll('.tts-word.tts-speaking').forEach(el => el.classList.remove('tts-speaking'));
+  _clearTtsSentenceHighlight();
   const btn = document.getElementById('reader-tts-btn');
   const bar = document.getElementById('reader-tts-bar');
   if (btn) btn.classList.remove('active');
@@ -3239,86 +3251,86 @@ function startReaderTts() {
   if (bar) bar.style.display = 'flex';
   const btn = document.getElementById('reader-tts-btn');
   if (btn) btn.classList.add('active');
+
+  // Check bookmark: start from saved word position
+  let fromWord = 0;
+  const bm = getBm();
+  if (bm && bm.rsvpWordIndex != null && bm.rsvpWordIndex < readerTtsWords.length) {
+    fromWord = bm.rsvpWordIndex;
+  } else if (bm && bm.scrollRatio != null) {
+    fromWord = Math.round(bm.scrollRatio * (readerTtsWords.length - 1));
+  }
+
   _readerTtsGen++;
-  _speakChapterFrom(0, _readerTtsGen);
+  _ttsSentences = _buildTtsSentences(readerTtsWords, fromWord);
+  _ttsSentIdx   = 0;
+  _speakSentence(_ttsSentIdx, _readerTtsGen);
 }
 
-// Speak the entire chapter starting at word index `fromIdx` as ONE utterance.
-// No inter-utterance gaps. Chrome keepalive prevents auto-stop at ~15 s.
-function _speakChapterFrom(fromIdx, gen) {
+// Speak sentence at index `idx`. Chains to idx+1 via utt.onend — no synth.cancel between.
+function _speakSentence(idx, gen) {
   if (!readerTtsActive || gen !== _readerTtsGen) return;
-  if (fromIdx >= readerTtsWords.length) { ttsStopReaderMode(); return; }
+  if (idx >= _ttsSentences.length) { ttsStopReaderMode(); return; }
 
-  const text = readerTtsWords.slice(fromIdx).map(w => w.textContent).join(' ');
-  if (!text.trim()) { ttsStopReaderMode(); return; }
+  const sent = _ttsSentences[idx];
+  _ttsSentIdx  = idx;
 
-  const rng = document.getElementById('reader-tts-rate');
+  // Sentence highlight: dim all, activate this sentence
+  _clearTtsSentenceHighlight();
+  sent.words.forEach(w => w.classList.add('tts-sentence-active'));
+  if (sent.words[0]) sent.words[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  // Track global word index for bookmark
+  readerTtsCurrent = sent.startWordIdx;
+
+  const rng  = document.getElementById('reader-tts-rate');
   const rate = rng ? parseFloat(rng.value) : 1;
 
-  const utt = new SpeechSynthesisUtterance(text);
-  readerTtsUtterance = utt;
+  const utt = new SpeechSynthesisUtterance(sent.text);
   utt.rate  = rate;
   utt.voice = getVoice('reader-tts-voice');
 
+  // Word-level highlight via onboundary
   let boundaryFired = false;
   utt.onboundary = ev => {
-    if (readerTtsUtterance !== utt || gen !== _readerTtsGen) return;
-    if (ev.name !== 'word') return;
+    if (gen !== _readerTtsGen || ev.name !== 'word') return;
     boundaryFired = true;
-    const charIdx  = ev.charIndex || 0;
-    const spoken   = text.slice(0, charIdx).trim();
-    const cnt      = spoken ? spoken.split(/\s+/).length : 0;
-    const wordIdx  = Math.min(fromIdx + cnt, readerTtsWords.length - 1);
-    readerTtsWords.forEach(w => w.classList.remove('tts-speaking'));
-    readerTtsCurrent = wordIdx;
-    if (readerTtsWords[wordIdx]) {
-      readerTtsWords[wordIdx].classList.add('tts-speaking');
-      readerTtsWords[wordIdx].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
+    const charIdx = ev.charIndex || 0;
+    const spoken  = sent.text.slice(0, charIdx).trim();
+    const cnt     = spoken ? spoken.split(/\s+/).length : 0;
+    const wLocal  = Math.min(cnt, sent.words.length - 1);
+    sent.words.forEach(w => w.classList.remove('tts-speaking'));
+    sent.words[wLocal].classList.add('tts-speaking');
+    readerTtsCurrent = sent.startWordIdx + wLocal;
   };
 
-  // Fallback timer highlight for browsers without onboundary (Firefox/Android)
+  // Fallback timer for browsers without onboundary
   setTimeout(() => {
     if (gen !== _readerTtsGen || !readerTtsActive || boundaryFired) return;
     const msPerWord = Math.max(60, 60000 / (rate * 160));
-    let fi = fromIdx;
-    function readerTick() {
+    let fi = 0;
+    function tick() {
       if (gen !== _readerTtsGen || !readerTtsActive || boundaryFired) return;
-      readerTtsWords.forEach(w => w.classList.remove('tts-speaking'));
-      readerTtsCurrent = fi;
-      if (readerTtsWords[fi]) {
-        readerTtsWords[fi].classList.add('tts-speaking');
-        readerTtsWords[fi].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      }
+      sent.words.forEach(w => w.classList.remove('tts-speaking'));
+      if (sent.words[fi]) sent.words[fi].classList.add('tts-speaking');
+      readerTtsCurrent = sent.startWordIdx + fi;
       fi++;
-      if (fi < readerTtsWords.length) setTimeout(readerTick, msPerWord);
+      if (fi < sent.words.length) setTimeout(tick, msPerWord);
     }
-    readerTick();
-  }, 400);
+    tick();
+  }, 500);
 
+  // Chain to next sentence via onend — NO synth.cancel(), which avoids the inter-word pause
   utt.onend = () => {
-    if (readerTtsUtterance !== utt || gen !== _readerTtsGen) return;
-    _clearReaderKA();
-    ttsStopReaderMode();
+    if (gen !== _readerTtsGen || !readerTtsActive) return;
+    _speakSentence(idx + 1, gen);
   };
   utt.onerror = e => {
     if (e.error === 'interrupted' || e.error === 'canceled') return;
-    _clearReaderKA();
     ttsStopReaderMode();
   };
 
-  // Chrome keepalive: synth stops itself after ~15 s; pause+resume prevents that
-  _clearReaderKA();
-  _readerTtsKA = setInterval(() => {
-    if (gen !== _readerTtsGen || !readerTtsActive) { _clearReaderKA(); return; }
-    if (synth.speaking && !synth.paused) { synth.pause(); synth.resume(); }
-  }, 12000);
-
-  synth.cancel();
-  setTimeout(() => {
-    if (gen !== _readerTtsGen || !readerTtsActive) return;
-    synth.speak(utt);
-  }, 30);
+  synth.speak(utt);
 }
 
 _on('reader-tts-btn',  'click', () => { if (readerTtsActive) ttsStopReaderMode(); else startReaderTts(); });
@@ -3326,14 +3338,16 @@ _on('reader-tts-stop', 'click', ttsStopReaderMode);
 _on('reader-tts-rate', 'input', e => {
   const lbl = document.getElementById('reader-tts-rate-lbl');
   if (lbl) lbl.textContent = '×' + parseFloat(e.target.value).toFixed(1);
-  // Restart from current word so new rate takes effect immediately
-  if (readerTtsActive && readerTtsCurrent >= 0) {
-    const resumeIdx = readerTtsCurrent;
+  // Restart from current sentence so new rate takes effect immediately
+  if (readerTtsActive) {
+    const resumeWord = readerTtsCurrent >= 0 ? readerTtsCurrent : 0;
     _readerTtsGen++;
     const gen = _readerTtsGen;
-    _clearReaderKA();
     synth.cancel();
-    setTimeout(() => { if (gen === _readerTtsGen && readerTtsActive) _speakChapterFrom(resumeIdx, gen); }, 30);
+    _clearTtsSentenceHighlight();
+    _ttsSentences = _buildTtsSentences(readerTtsWords, resumeWord);
+    _ttsSentIdx   = 0;
+    setTimeout(() => { if (gen === _readerTtsGen && readerTtsActive) _speakSentence(0, gen); }, 30);
   }
 });
 
