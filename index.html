@@ -3260,19 +3260,24 @@ function startTimerFallback(gen) {
 }
 
 // ── Boundary fallback for TTS (Firefox/Android) ──
-function _startBoundaryFallback(gen) {
+// state.boundaryReceived allows onboundary to cancel this fallback mid-run.
+// ttsRate is utt.rate so timing mirrors the actual voice speed.
+function _startBoundaryFallback(gen, state, ttsRate) {
   if (_timerGeneration !== gen) return;
-  const msPerWord = 60000 / (rsvpWpm * rsvpChunkSize);
+  // Derive ms/word from the voice rate; never faster than the voice.
+  const voiceWpm  = Math.max(60, (ttsRate || 1) * 160);
+  const msPerWord = 60000 / voiceWpm;
   let lastAdvance = performance.now();
 
   function check() {
-    if (_timerGeneration !== gen || !rsvpPlaying) return;
+    // Stop if: generation changed, playback stopped, OR onboundary started firing
+    if (_timerGeneration !== gen || !rsvpPlaying || (state && state.boundaryReceived)) return;
     const now = performance.now();
     if (now - lastAdvance >= msPerWord * 0.9) {
       lastAdvance = now;
       rsvpIdx++;
       if (rsvpIdx >= rsvpWords.length) {
-        _rsvpAdvanceChapter(gen, () => { if (_timerGeneration === gen) _startBoundaryFallback(gen); });
+        _rsvpAdvanceChapter(gen, () => { if (_timerGeneration === gen) _startBoundaryFallback(gen, state, ttsRate); });
         return;
       }
       updateRsvpDisplay();
@@ -3313,14 +3318,18 @@ function ttsPlayBatch(startIdx) {
   if (vol)   utt.volume = parseInt(vol.value)   / 100;
   if (pitch) utt.pitch  = parseFloat(pitch.value);
 
-  let boundaryReceived = false;
+  // Shared state so the fallback timer can yield to onboundary if it fires late
+  const state = { boundaryReceived: false };
+
   utt.onboundary = ev => {
     if (ttsUtterance !== utt || _timerGeneration !== gen) return;
-    boundaryReceived = true;
-    // Calculate which word we're on
+    state.boundaryReceived = true; // stops the fallback timer immediately
+    if (ev.name && ev.name !== 'word') return; // ignore sentence boundaries
     const charIdx = ev.charIndex || 0;
-    const spoken  = text.slice(0, charIdx).trim().split(/\s+/).length;
-    rsvpIdx       = Math.min(startIdx + spoken, rsvpWords.length - 1);
+    // Fix off-by-one: when charIdx=0 (first word) spoken count must be 0
+    const spokenText = charIdx > 0 ? text.slice(0, charIdx).trim() : '';
+    const cnt = spokenText ? spokenText.split(/\s+/).length : 0;
+    rsvpIdx   = Math.min(startIdx + cnt, rsvpWords.length - 1);
     updateRsvpDisplay();
     updateRsvpScrub();
   };
@@ -3345,12 +3354,13 @@ function ttsPlayBatch(startIdx) {
     stopRsvp(false);
   };
 
-  // Start boundary fallback for browsers that don't fire onboundary
+  // Boundary fallback: only starts if no boundary received within 600 ms.
+  // Passes state so it stops the moment onboundary fires (even if late).
   setTimeout(() => {
-    if (_timerGeneration === gen && !boundaryReceived && rsvpPlaying) {
-      _startBoundaryFallback(gen);
+    if (_timerGeneration === gen && !state.boundaryReceived && rsvpPlaying) {
+      _startBoundaryFallback(gen, state, utt.rate);
     }
-  }, 400);
+  }, 600);
 
   // 30ms delay before speak() to ensure cancel() flush
   setTimeout(() => {
