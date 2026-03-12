@@ -2320,7 +2320,10 @@ _on('bookmark-btn', 'click', () => {
   const rc = document.getElementById('reader-content');
   if (!rc) return;
   const ratio = rc.scrollTop / Math.max(1, rc.scrollHeight - rc.clientHeight);
-  saveBm({ scrollRatio: ratio, chapterIndex: currentChapterIndex });
+  // Also estimate rsvpWordIndex from current scroll ratio so RSVP starts at same position
+  const allWords = rc.querySelectorAll('.tts-word');
+  const estRsvpIdx = allWords.length ? Math.min(Math.round(ratio * Math.max(0, allWords.length - 1)), allWords.length - 1) : null;
+  saveBm({ scrollRatio: ratio, chapterIndex: currentChapterIndex, rsvpWordIndex: estRsvpIdx });
   refreshBookmarkUI();
   updateEpubScrub();
   showNotification('🔖 Posición guardada');
@@ -2376,13 +2379,17 @@ _on('ctx-save-pos', 'click', () => {
   const rc = document.getElementById('reader-content');
   if (rc) {
     const ratio = rc.scrollTop / Math.max(1, rc.scrollHeight - rc.clientHeight);
-    saveBm({ scrollRatio: ratio, chapterIndex: currentChapterIndex });
+    const allWords = rc.querySelectorAll('.tts-word');
+    const estRsvpIdx = allWords.length ? Math.min(Math.round(ratio * Math.max(0, allWords.length - 1)), allWords.length - 1) : null;
+    saveBm({ scrollRatio: ratio, chapterIndex: currentChapterIndex, rsvpWordIndex: estRsvpIdx });
     refreshBookmarkUI(); showNotification('🔖 Posición guardada');
   }
 });
 _on('ctx-save-rsvp', 'click', () => {
   hideCtxMenu();
-  saveBm({ rsvpWordIndex: rsvpIdx });
+  // Save RSVP position + equivalent scroll ratio for normal reading sync
+  const scrollRatio = rsvpWords.length > 0 ? rsvpIdx / Math.max(1, rsvpWords.length - 1) : null;
+  saveBm({ rsvpWordIndex: rsvpIdx, scrollRatio, chapterIndex: currentChapterIndex });
   refreshBookmarkUI(); showNotification('🔖 Posición RSVP guardada');
 });
 
@@ -2686,30 +2693,37 @@ function doSearch() {
   const rc  = document.getElementById('reader-content');
   if (!rc) return;
 
-  // Clear old
+  // Clear old highlights, normalize once at the end
   rc.querySelectorAll('.search-highlight').forEach(el => {
-    if (el.parentNode) { el.parentNode.replaceChild(document.createTextNode(el.textContent), el); el.parentNode.normalize(); }
+    if (el.parentNode) el.parentNode.replaceChild(document.createTextNode(el.textContent), el);
   });
+  rc.normalize();
   searchResults = []; searchIdx = -1;
   if (!q) { const cnt = document.getElementById('reader-search-count'); if (cnt) cnt.textContent = ''; return; }
 
-  // Walk text nodes
+  // Walk text nodes — find ALL occurrences per node
   function walk(node) {
     if (node.nodeType === 3) {
-      const idx = node.textContent.toLowerCase().indexOf(q.toLowerCase());
-      if (idx === -1) return;
-      const before = document.createTextNode(node.textContent.slice(0, idx));
-      const mark   = document.createElement('mark');
-      mark.className   = 'search-highlight';
-      mark.textContent = node.textContent.slice(idx, idx + q.length);
-      const after  = document.createTextNode(node.textContent.slice(idx + q.length));
+      const text   = node.textContent;
+      const lower  = text.toLowerCase();
+      const qLower = q.toLowerCase();
+      let start = 0, offset;
+      const parts = [];
+      while ((offset = lower.indexOf(qLower, start)) !== -1) {
+        if (offset > start) parts.push(document.createTextNode(text.slice(start, offset)));
+        const mark       = document.createElement('mark');
+        mark.className   = 'search-highlight';
+        mark.textContent = text.slice(offset, offset + q.length);
+        parts.push(mark);
+        start = offset + q.length;
+      }
+      if (!parts.length) return;
+      if (start < text.length) parts.push(document.createTextNode(text.slice(start)));
       const parent = node.parentNode;
       if (!parent) return;
-      parent.insertBefore(before, node);
-      parent.insertBefore(mark,   node);
-      parent.insertBefore(after,  node);
+      parts.forEach(p => parent.insertBefore(p, node));
       parent.removeChild(node);
-      searchResults.push(mark);
+      parts.forEach(p => { if (p.nodeType === 1) searchResults.push(p); });
     } else if (node.nodeType === 1 && !['SCRIPT','STYLE'].includes(node.tagName)) {
       Array.from(node.childNodes).forEach(walk);
     }
@@ -2924,11 +2938,20 @@ _on('sel-note-btn', 'click', () => {
 });
 
 // ═══════════════════════════════════════════════
-// READER TTS (word-by-word in reader mode)
+// READER TTS (batch speech — no word-by-word pauses)
 // ═══════════════════════════════════════════════
+let readerTtsUtterance = null, readerTtsBatchStart = 0, _readerTtsGen = 0;
+
 function ttsStopReaderMode() {
   if (!readerTtsActive) return;
+  // Save unified bookmark before stopping
+  if (currentBook && readerTtsCurrent >= 0 && readerTtsWords.length > 0) {
+    const scrollRatio = readerTtsCurrent / Math.max(1, readerTtsWords.length - 1);
+    saveBm({ rsvpWordIndex: readerTtsCurrent, scrollRatio, chapterIndex: currentChapterIndex });
+  }
+  _readerTtsGen++;
   readerTtsActive = false;
+  readerTtsUtterance = null;
   synth.cancel();
   readerTtsCurrent = -1;
   const rc = document.getElementById('reader-content');
@@ -2952,30 +2975,79 @@ function startReaderTts() {
   const btn = document.getElementById('reader-tts-btn');
   if (btn) btn.classList.add('active');
 
-  speakReaderWord();
+  _readerTtsGen++;
+  speakReaderBatch(0, _readerTtsGen);
 }
 
-function speakReaderWord() {
-  if (!readerTtsActive || readerTtsCurrent >= readerTtsWords.length) {
+function speakReaderBatch(startIdx, gen) {
+  if (!readerTtsActive || gen !== _readerTtsGen) return;
+  if (startIdx >= readerTtsWords.length) { ttsStopReaderMode(); return; }
+
+  const batchEnd = Math.min(readerTtsWords.length, startIdx + 200);
+  const batchWords = readerTtsWords.slice(startIdx, batchEnd);
+  const text = batchWords.map(w => w.textContent).join(' ');
+  if (!text.trim()) { ttsStopReaderMode(); return; }
+
+  readerTtsBatchStart = startIdx;
+  const utt = new SpeechSynthesisUtterance(text);
+  readerTtsUtterance = utt;
+  const rng = document.getElementById('reader-tts-rate');
+  utt.rate  = rng ? parseFloat(rng.value) : 1;
+  utt.voice = getVoice('reader-tts-voice');
+
+  // Highlight current word via boundary events
+  let boundaryReceived = false;
+  utt.onboundary = ev => {
+    if (readerTtsUtterance !== utt || gen !== _readerTtsGen) return;
+    if (ev.name !== 'word') return;
+    boundaryReceived = true;
+    const charIdx   = ev.charIndex || 0;
+    const spokenTxt = text.slice(0, charIdx).trim();
+    const spokenCnt = spokenTxt ? spokenTxt.split(/\s+/).length : 0;
+    const wordIdx   = Math.min(startIdx + spokenCnt, batchEnd - 1);
+    readerTtsWords.forEach(w => w.classList.remove('tts-speaking'));
+    readerTtsCurrent = wordIdx;
+    if (readerTtsWords[wordIdx]) {
+      readerTtsWords[wordIdx].classList.add('tts-speaking');
+      readerTtsWords[wordIdx].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  };
+
+  // Fallback: advance word highlight by timer if onboundary not fired
+  setTimeout(() => {
+    if (gen === _readerTtsGen && readerTtsActive && !boundaryReceived) {
+      let fi = startIdx;
+      const msPerWord = 60000 / (((rng ? parseFloat(rng.value) : 1) * 150) || 150);
+      function readerTick() {
+        if (gen !== _readerTtsGen || !readerTtsActive || boundaryReceived) return;
+        readerTtsWords.forEach(w => w.classList.remove('tts-speaking'));
+        readerTtsCurrent = fi;
+        if (readerTtsWords[fi]) {
+          readerTtsWords[fi].classList.add('tts-speaking');
+          readerTtsWords[fi].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+        fi++;
+        if (fi < batchEnd) setTimeout(readerTick, msPerWord);
+      }
+      setTimeout(readerTick, msPerWord);
+    }
+  }, 300);
+
+  utt.onend = () => {
+    if (readerTtsUtterance !== utt || gen !== _readerTtsGen) return;
+    if (batchEnd < readerTtsWords.length && readerTtsActive) {
+      readerTtsCurrent = batchEnd;
+      speakReaderBatch(batchEnd, gen);
+    } else {
+      ttsStopReaderMode();
+    }
+  };
+  utt.onerror = e => {
+    if (e.error === 'interrupted' || e.error === 'canceled') return;
     ttsStopReaderMode();
-    return;
-  }
-  const wordEl = readerTtsWords[readerTtsCurrent];
-  if (!wordEl) { ttsStopReaderMode(); return; }
+  };
 
-  readerTtsWords.forEach(w => w.classList.remove('tts-speaking'));
-  wordEl.classList.add('tts-speaking');
-  wordEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-
-  const text = wordEl.textContent.trim();
-  if (!text) { readerTtsCurrent++; speakReaderWord(); return; }
-
-  const utt  = new SpeechSynthesisUtterance(text);
-  const rng  = document.getElementById('reader-tts-rate');
-  utt.rate   = rng ? parseFloat(rng.value) : 1;
-  utt.voice  = getVoice('reader-tts-voice');
-  utt.onend  = () => { if (readerTtsActive) { readerTtsCurrent++; speakReaderWord(); } };
-  utt.onerror= e => { if (e.error === 'interrupted' || e.error === 'canceled') return; ttsStopReaderMode(); };
+  synth.cancel();
   synth.speak(utt);
 }
 
@@ -2987,6 +3059,14 @@ _on('reader-tts-stop', 'click', ttsStopReaderMode);
 _on('reader-tts-rate', 'input', e => {
   const lbl = document.getElementById('reader-tts-rate-lbl');
   if (lbl) lbl.textContent = '×' + parseFloat(e.target.value).toFixed(1);
+  // Restart from current word so new rate takes effect immediately
+  if (readerTtsActive && readerTtsCurrent >= 0) {
+    const resumeIdx = readerTtsCurrent;
+    _readerTtsGen++;
+    const gen = _readerTtsGen;
+    synth.cancel();
+    setTimeout(() => { if (gen === _readerTtsGen && readerTtsActive) speakReaderBatch(resumeIdx, gen); }, 30);
+  }
 });
 
 // ═══════════════════════════════════════════════
@@ -3008,8 +3088,17 @@ function startRsvp() {
   if (!rsvpWords.length) { showNotification('No hay texto cargado'); return; }
 
   const bm = getBm();
-  if (bm && bm.rsvpWordIndex != null && bm.rsvpWordIndex < rsvpWords.length) {
-    rsvpIdx = bm.rsvpWordIndex;
+  if (bm) {
+    if (bm.rsvpWordIndex != null && bm.rsvpWordIndex < rsvpWords.length) {
+      // Exact word index from a previous RSVP/TTS session
+      rsvpIdx = bm.rsvpWordIndex;
+    } else if (bm.scrollRatio != null) {
+      // Fallback: convert normal-reading scroll ratio to word index
+      rsvpIdx = Math.min(
+        Math.round(bm.scrollRatio * Math.max(0, rsvpWords.length - 1)),
+        rsvpWords.length - 1
+      );
+    }
   }
 
   const overlay = document.getElementById('speed-overlay');
@@ -3036,7 +3125,9 @@ function stopRsvp(autoBookmark) {
   if (dot) dot.classList.remove('active');
 
   if (autoBookmark && currentBook && rsvpWords.length > 0) {
-    saveBm({ rsvpWordIndex: rsvpIdx });
+    // Save unified bookmark: word index + equivalent scroll ratio so normal reading bookmark aligns
+    const scrollRatio = rsvpIdx / Math.max(1, rsvpWords.length - 1);
+    saveBm({ rsvpWordIndex: rsvpIdx, scrollRatio, chapterIndex: currentChapterIndex });
     refreshBookmarkUI();
   }
 }
@@ -3088,6 +3179,26 @@ function updateRsvpScrub() {
   if (lblL) lblL.textContent = Math.round(ratio * 100) + '%';
 }
 
+// ── Advance to next chapter in RSVP, or stop if last chapter ──
+function _rsvpAdvanceChapter(gen, onReady) {
+  if (_timerGeneration !== gen || !rsvpPlaying) return;
+  if (currentChapterIndex < chapters.length - 1) {
+    currentChapterIndex++;
+    loadChapter(() => {
+      if (_timerGeneration !== gen || !rsvpPlaying) return;
+      rsvpWords = extractWordsFromReader();
+      rsvpIdx   = 0;
+      const wTotal = document.getElementById('word-total');
+      if (wTotal) wTotal.textContent = '/ ' + rsvpWords.length;
+      updateRsvpDisplay();
+      updateRsvpScrub();
+      if (onReady) onReady();
+    });
+  } else {
+    stopRsvp(true);
+  }
+}
+
 // ── Timer-based fallback (when voice is off) ──
 function startTimerFallback(gen) {
   if (_timerGeneration !== gen) return;
@@ -3097,8 +3208,7 @@ function startTimerFallback(gen) {
     if (_timerGeneration !== gen || !rsvpPlaying) return;
     rsvpIdx += rsvpChunkSize;
     if (rsvpIdx >= rsvpWords.length) {
-      rsvpIdx = rsvpWords.length - 1;
-      stopRsvp(true);
+      _rsvpAdvanceChapter(gen, () => { if (_timerGeneration === gen) startTimerFallback(gen); });
       return;
     }
     updateRsvpDisplay();
@@ -3120,7 +3230,10 @@ function _startBoundaryFallback(gen) {
     if (now - lastAdvance >= msPerWord * 0.9) {
       lastAdvance = now;
       rsvpIdx++;
-      if (rsvpIdx >= rsvpWords.length) { stopRsvp(true); return; }
+      if (rsvpIdx >= rsvpWords.length) {
+        _rsvpAdvanceChapter(gen, () => { if (_timerGeneration === gen) _startBoundaryFallback(gen); });
+        return;
+      }
       updateRsvpDisplay();
       updateRsvpScrub();
     }
@@ -3177,7 +3290,12 @@ function ttsPlayBatch(startIdx) {
       rsvpIdx = ttsNextBatchStart;
       setTimeout(() => { if (_timerGeneration === gen && rsvpPlaying) ttsPlayBatch(rsvpIdx); }, 30);
     } else {
-      stopRsvp(true);
+      _rsvpAdvanceChapter(gen, () => {
+        if (_timerGeneration === gen && rsvpPlaying) {
+          synth.cancel();
+          setTimeout(() => { if (_timerGeneration === gen && rsvpPlaying) ttsPlayBatch(0); }, 30);
+        }
+      });
     }
   };
   utt.onerror = e => {
@@ -3559,7 +3677,7 @@ async function getPdfPageText(pageNum) {
   try {
     const page    = await pdfDoc.getPage(pageNum);
     const content = await page.getTextContent();
-    const text    = content.items.map(i => i.str).join(' ');
+    const text    = content.items.map(i => i.str).filter(s => s.trim()).join(' ').replace(/\s+/g, ' ').trim();
     pdfTtsPageTexts[pageNum] = text;
     return text;
   } catch(e) { return ''; }
@@ -3705,6 +3823,11 @@ _on('pdf-tts-stop', 'click', stopPdfTts);
 _on('pdf-tts-rate', 'input', e => {
   const lbl = document.getElementById('pdf-tts-rate-lbl');
   if (lbl) lbl.textContent = '×' + parseFloat(e.target.value).toFixed(1);
+  // Restart current page so new rate takes effect immediately
+  if (pdfTtsActive) {
+    stopPdfTts();
+    setTimeout(startPdfTts, 30);
+  }
 });
 
 })(); // end PDF IIFE
