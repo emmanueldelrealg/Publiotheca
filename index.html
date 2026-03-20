@@ -1276,9 +1276,11 @@
       </div>
     </div>
     <div id="reader-tts-bar" style="display:none;">
+      <button class="tts-nav-btn" id="reader-tts-rew" title="-30 palabras">«−30</button>
       <button class="tts-nav-btn" id="reader-tts-prev" title="Oración anterior">⏮</button>
       <button class="tts-playpause-btn" id="reader-tts-playpause" title="Pausar">⏸</button>
       <button class="tts-nav-btn" id="reader-tts-next" title="Oración siguiente">⏭</button>
+      <button class="tts-nav-btn" id="reader-tts-fwd" title="+30 palabras">+30»</button>
       <span class="tts-lbl">Vel:</span>
       <input type="range" class="tts-rng" id="reader-tts-rate" min="0.5" max="3" step="0.05" value="1">
       <span class="tts-rlbl" id="reader-tts-rate-lbl">×1.0</span>
@@ -1309,8 +1311,10 @@
         <button class="rdr-btn" id="pdf-rsvp-btn" title="Lectura Rápida RSVP">⚡</button>
       </div>
       <div id="pdf-tts-bar" style="display:none;">
+        <button class="tts-nav-btn" id="pdf-tts-rew" title="-30 palabras">«−30</button>
         <button class="tts-playpause-btn" id="pdf-tts-playpause" title="Pausar">⏸</button>
         <button class="tts-stop" id="pdf-tts-stop" title="Detener">⏹</button>
+        <button class="tts-nav-btn" id="pdf-tts-fwd" title="+30 palabras">+30»</button>
         <span class="tts-lbl">Vel:</span>
         <input type="range" class="tts-rng" id="pdf-tts-rate" min="0.5" max="3" step="0.05" value="1">
         <span class="tts-rlbl" id="pdf-tts-rate-lbl">×1.0</span>
@@ -1792,6 +1796,7 @@ let pdfTtsStopOnRender = false;
 let pdfTtsPaused      = false;
 let pdfTtsSpanMap     = [];   // [{span, start, end}] rebuilt each page render
 let pdfTtsKeepAlive   = null;
+let pdfTtsCharIdx     = 0;    // last charIndex from onboundary (absolute in page text)
 
 // RSVP state
 let _timerGeneration = 0;
@@ -3604,11 +3609,29 @@ function readerTtsJumpSentence(delta) {
   setTimeout(() => { if (gen === _readerTtsGen && readerTtsActive) _speakChunk(0, gen); }, 60);
 }
 
+// ── Jump ±N words in EPUB TTS ──
+function readerTtsJumpWords(delta) {
+  if (!readerTtsActive || !readerTtsWords.length) return;
+  const wordIdx = Math.max(0, Math.min(readerTtsWords.length - 1, readerTtsCurrent + delta));
+  _readerTtsGen++;
+  const gen = _readerTtsGen;
+  _readerTtsPaused = false;
+  synth.cancel();
+  _clearTtsSentenceHighlight();
+  _ttsChunks   = _buildTtsChunks(readerTtsWords, wordIdx);
+  _ttsChunkIdx = 0;
+  _startTtsKeepAlive();
+  _updateTtsPlayPauseBtn();
+  setTimeout(() => { if (gen === _readerTtsGen && readerTtsActive) _speakChunk(0, gen); }, 60);
+}
+
 _on('reader-tts-btn',       'click', () => { if (readerTtsActive) ttsStopReaderMode(); else startReaderTts(); });
 _on('reader-tts-stop',      'click', ttsStopReaderMode);
 _on('reader-tts-playpause', 'click', toggleReaderTtsPause);
 _on('reader-tts-prev',      'click', () => readerTtsJumpSentence(-1));
 _on('reader-tts-next',      'click', () => readerTtsJumpSentence(1));
+_on('reader-tts-rew',       'click', () => readerTtsJumpWords(-30));
+_on('reader-tts-fwd',       'click', () => readerTtsJumpWords(30));
 _on('reader-tts-rate', 'input', e => {
   const lbl = document.getElementById('reader-tts-rate-lbl');
   if (lbl) lbl.textContent = '×' + parseFloat(e.target.value).toFixed(1);
@@ -4344,16 +4367,20 @@ function _pdfTtsHighlight(charIdx) {
 }
 
 // ── PDF TTS — MUST be synchronous, not async ──
-function startPdfTts() {
-  const text = pdfTtsPageTexts[pdfPage];
-  if (!text) {
-    getPdfPageText(pdfPage).then(t => { if (t && !pdfTtsActive) startPdfTts(); });
+function startPdfTts(fromChar) {
+  const fullText = pdfTtsPageTexts[pdfPage];
+  if (!fullText) {
+    getPdfPageText(pdfPage).then(t => { if (t && !pdfTtsActive) startPdfTts(fromChar); });
     return;
   }
+
+  const charOffset = fromChar || 0;
+  const text = charOffset > 0 ? fullText.slice(charOffset) : fullText;
 
   stopPdfTts();
   pdfTtsActive  = true;
   pdfTtsPaused  = false;
+  pdfTtsCharIdx = charOffset;
 
   const utt  = new SpeechSynthesisUtterance(text);
   pdfTtsUtterance = utt;
@@ -4365,7 +4392,8 @@ function startPdfTts() {
   utt.onboundary = ev => {
     if (pdfTtsUtterance !== utt) return;
     if (ev.name && ev.name !== 'word') return;
-    _pdfTtsHighlight(ev.charIndex || 0);
+    pdfTtsCharIdx = charOffset + (ev.charIndex || 0);
+    _pdfTtsHighlight(pdfTtsCharIdx);
   };
 
   utt.onend = () => {
@@ -4375,7 +4403,7 @@ function startPdfTts() {
     if (pdfDoc && pdfPage < pdfDoc.numPages) {
       pdfPage++;
       pdfTtsStopOnRender = false;
-      renderPdfPage().then(() => { if (pdfTtsActive) startPdfTts(); });
+      renderPdfPage().then(() => { if (pdfTtsActive) startPdfTts(0); });
     } else {
       stopPdfTts();
     }
@@ -4396,6 +4424,42 @@ function startPdfTts() {
 
   synth.cancel();
   synth.speak(utt);
+}
+
+// ── Jump ±N words in PDF TTS ──
+function jumpPdfTtsWords(delta) {
+  if (!pdfTtsActive) return;
+  const fullText = pdfTtsPageTexts[pdfPage];
+  if (!fullText) return;
+
+  let pos = pdfTtsCharIdx;
+  if (delta > 0) {
+    // Skip forward: advance |delta| word boundaries from pos
+    let count = 0;
+    let i = pos;
+    while (i < fullText.length && count < delta) {
+      while (i < fullText.length && /\s/.test(fullText[i])) i++;  // skip spaces
+      while (i < fullText.length && !/\s/.test(fullText[i])) i++; // skip word
+      count++;
+    }
+    pos = Math.min(i, fullText.length - 1);
+  } else {
+    // Skip backward: go back |delta| words from pos
+    let count = 0;
+    let i = Math.min(pos, fullText.length - 1);
+    // step back before the current word
+    while (i > 0 && /\s/.test(fullText[i])) i--;
+    while (count < -delta) {
+      while (i > 0 && !/\s/.test(fullText[i])) i--; // skip to space before word
+      while (i > 0 && /\s/.test(fullText[i])) i--;  // skip spaces
+      count++;
+    }
+    // move to start of this word
+    while (i > 0 && !/\s/.test(fullText[i - 1])) i--;
+    pos = Math.max(0, i);
+  }
+
+  startPdfTts(pos);
 }
 
 function stopPdfTts() {
@@ -4506,6 +4570,8 @@ _on('pdf-scroll-toggle', 'click', () => {
 _on('pdf-tts-btn',      'click', () => { if (pdfTtsActive) stopPdfTts(); else startPdfTts(); });
 _on('pdf-tts-stop',     'click', stopPdfTts);
 _on('pdf-tts-playpause','click', togglePdfTtsPause);
+_on('pdf-tts-rew',      'click', () => jumpPdfTtsWords(-30));
+_on('pdf-tts-fwd',      'click', () => jumpPdfTtsWords(30));
 _on('pdf-tts-rate', 'input', e => {
   const lbl = document.getElementById('pdf-tts-rate-lbl');
   if (lbl) lbl.textContent = '×' + parseFloat(e.target.value).toFixed(1);
