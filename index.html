@@ -695,17 +695,26 @@
   }
   .pdf-scroll-btn.active { background: rgba(200,137,58,0.14); color: var(--amber); border-color: rgba(200,137,58,0.32); }
   #pdf-tts-bar {
-    background: rgba(5,3,1,0.97);
-    border-bottom: 1px solid rgba(74,103,165,0.18);
-    padding: 0.38rem 1rem;
-    display: flex; align-items: center; gap: 0.65rem; flex-wrap: wrap; flex-shrink: 0;
+    background: #1e2a4a;
+    border-bottom: 1px solid rgba(74,105,189,0.3);
+    padding: 0.55rem 1rem;
+    display: flex; align-items: center; gap: 0.75rem;
+    flex-shrink: 0; flex-wrap: wrap;
   }
   #pdf-tts-status {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.62rem; color: rgba(138,172,238,0.55); flex: 1;
+    font-size: 0.7rem; color: rgba(160,185,240,0.7); flex: 1;
     animation: pulse 1.5s ease-in-out infinite;
   }
-  @keyframes pulse { 0%,100%{opacity:0.55;} 50%{opacity:1;} }
+  #pdf-tts-status.paused { animation: none; opacity: 0.5; }
+  @keyframes pulse { 0%,100%{opacity:0.6;} 50%{opacity:1;} }
+  /* PDF read-aloud word highlight — makes invisible span text visible + colored */
+  .pdf-tts-highlight {
+    color: #1a1a1a !important;
+    background: rgba(255, 215, 50, 0.88) !important;
+    border-radius: 2px;
+    opacity: 1 !important;
+    transition: background 0.1s;
+  }
   #pdf-canvas-wrap {
     flex: 1; overflow: auto;
     display: flex; justify-content: center;
@@ -1300,13 +1309,13 @@
         <button class="rdr-btn" id="pdf-rsvp-btn" title="Lectura Rápida RSVP">⚡</button>
       </div>
       <div id="pdf-tts-bar" style="display:none;">
-        <span class="tts-lbl">Voz:</span>
-        <select class="tts-vsel" id="pdf-tts-voice"></select>
+        <button class="tts-playpause-btn" id="pdf-tts-playpause" title="Pausar">⏸</button>
+        <button class="tts-stop" id="pdf-tts-stop" title="Detener">⏹</button>
         <span class="tts-lbl">Vel:</span>
-        <input type="range" class="tts-rng" id="pdf-tts-rate" min="0.5" max="4" step="0.1" value="1">
+        <input type="range" class="tts-rng" id="pdf-tts-rate" min="0.5" max="3" step="0.05" value="1">
         <span class="tts-rlbl" id="pdf-tts-rate-lbl">×1.0</span>
-        <span id="pdf-tts-status">▶ Leyendo...</span>
-        <button class="tts-stop" id="pdf-tts-stop">⏹ Detener</button>
+        <select class="tts-vsel" id="pdf-tts-voice"></select>
+        <span id="pdf-tts-status">▶ leyendo...</span>
       </div>
       <div id="pdf-canvas-wrap">
         <canvas id="pdf-canvas"></canvas>
@@ -1341,7 +1350,10 @@
         <div class="reader-footer">
           <div class="page-nav">
             <button class="page-nav-btn" id="prev-chapter">◀</button>
-            <span id="chapter-indicator"></span>
+            <div style="display:flex;flex-direction:column;align-items:center;gap:1px;">
+              <span id="chapter-indicator"></span>
+              <span id="reader-reading-time" style="font-size:0.58rem;color:rgba(200,137,58,0.38);font-family:'JetBrains Mono',monospace;letter-spacing:0.04em;"></span>
+            </div>
             <button class="page-nav-btn" id="next-chapter">▶</button>
           </div>
           <div id="chapter-nav-bar"></div>
@@ -1587,6 +1599,7 @@
       <div class="wpm-display" style="text-align:right;">
         <span class="wpm-num" id="word-position">0</span>
         <span id="word-total">/ 0</span>
+        <span id="rsvp-time-remaining" style="display:block;font-size:0.62rem;color:rgba(200,137,58,0.45);margin-top:1px;"></span>
       </div>
       <button class="skip-btn" id="speed-forward" title="Siguiente">▶▶</button>
       <button class="skip-btn" id="speed-ffwd"    title="+30 palabras">⏭</button>
@@ -1776,6 +1789,9 @@ let pdfScrollMode     = false, pdfScrubDragging = false;
 let pdfTtsActive      = false, pdfTtsUtterance  = null;
 let pdfTtsPageTexts   = {};
 let pdfTtsStopOnRender = false;
+let pdfTtsPaused      = false;
+let pdfTtsSpanMap     = [];   // [{span, start, end}] rebuilt each page render
+let pdfTtsKeepAlive   = null;
 
 // RSVP state
 let _timerGeneration = 0;
@@ -1867,6 +1883,18 @@ function showConfirm(title, msg, onOk) {
 // ═══════════════════════════════════════════════
 function genId() {
   return String(Date.now()) + '_' + String(Math.random()).slice(2);
+}
+
+// ── Reading time estimate ──
+// Returns a human-readable string like "2 h 15 min" or "45 min" or "< 1 min"
+function _fmtReadTime(wordCount, wpm) {
+  if (!wordCount || !wpm || wpm <= 0) return '';
+  const mins = wordCount / wpm;
+  if (mins < 1) return '< 1 min';
+  const h = Math.floor(mins / 60);
+  const m = Math.round(mins % 60);
+  if (h > 0) return h + ' h ' + (m > 0 ? m + ' min' : '');
+  return m + ' min';
 }
 
 const PALETTES = [
@@ -2852,6 +2880,14 @@ function loadChapter(callback) {
   const ind = document.getElementById('chapter-indicator');
   if (ind) ind.textContent = 'Capítulo ' + (currentChapterIndex + 1) + ' / ' + chapters.length;
 
+  // Reading time estimate for current chapter
+  const rtEl = document.getElementById('reader-reading-time');
+  if (rtEl) {
+    const chWords = document.querySelectorAll('#reader-content .tts-word').length;
+    const wpm = rsvpWpm || 250;
+    rtEl.textContent = chWords > 0 ? _fmtReadTime(chWords, wpm) : '';
+  }
+
   buildTocPanel();
 
   setTimeout(() => {
@@ -3426,7 +3462,7 @@ function startReaderTts() {
 // ── Speak large chunk — minimal utterance boundaries → no inter-word gaps ──
 function _speakChunk(chunkIdx, gen) {
   if (!readerTtsActive || gen !== _readerTtsGen) return;
-  if (chunkIdx >= _ttsChunks.length) { ttsStopReaderMode(); return; }
+  if (chunkIdx >= _ttsChunks.length) { _ttsAdvanceChapter(gen); return; }
 
   const chunk = _ttsChunks[chunkIdx];
   _ttsChunkIdx     = chunkIdx;
@@ -3514,6 +3550,27 @@ function _speakChunk(chunkIdx, gen) {
   };
 
   synth.speak(utt);
+}
+
+// ── Advance to next chapter when TTS exhausts all chunks ──
+function _ttsAdvanceChapter(gen) {
+  if (!readerTtsActive || gen !== _readerTtsGen) return;
+  if (currentBook && currentBook.format === 'pdf') { ttsStopReaderMode(); return; }
+  if (currentChapterIndex < chapters.length - 1) {
+    currentChapterIndex++;
+    loadChapter(() => {
+      if (gen !== _readerTtsGen || !readerTtsActive) return;
+      wrapReaderWords();
+      readerTtsWords = Array.from(document.querySelectorAll('#reader-content .tts-word'));
+      _ttsSentences  = _buildSentenceList(readerTtsWords);
+      _ttsChunks     = _buildTtsChunks(readerTtsWords, 0);
+      _ttsChunkIdx   = 0;
+      readerTtsCurrent = 0;
+      setTimeout(() => { if (gen === _readerTtsGen && readerTtsActive) _speakChunk(0, gen); }, 60);
+    });
+  } else {
+    ttsStopReaderMode();
+  }
 }
 
 // ── Pause / Resume ──
@@ -3695,6 +3752,13 @@ function updateRsvpDisplay() {
   }
 
   if (posEl) posEl.textContent = rsvpIdx + 1;
+
+  // Reading time remaining
+  const remEl = document.getElementById('rsvp-time-remaining');
+  if (remEl && rsvpWords.length > 0) {
+    const wordsLeft = Math.max(0, rsvpWords.length - rsvpIdx);
+    remEl.textContent = _fmtReadTime(wordsLeft, rsvpWpm);
+  }
 }
 
 function updateRsvpScrub() {
@@ -3735,7 +3799,6 @@ function _rsvpAdvanceChapter(gen, onReady) {
 // ── Timer-based fallback (when voice is off) ──
 function startTimerFallback(gen) {
   if (_timerGeneration !== gen) return;
-  const msPerWord = 60000 / (rsvpWpm * rsvpChunkSize);
 
   function tick() {
     if (_timerGeneration !== gen || !rsvpPlaying) return;
@@ -3746,8 +3809,11 @@ function startTimerFallback(gen) {
     }
     updateRsvpDisplay();
     updateRsvpScrub();
+    // Read rsvpWpm live each tick so slider changes take immediate effect
+    const msPerWord = 60000 / (rsvpWpm * rsvpChunkSize);
     setTimeout(tick, msPerWord);
   }
+  const msPerWord = 60000 / (rsvpWpm * rsvpChunkSize);
   setTimeout(tick, msPerWord);
 }
 
@@ -4149,8 +4215,15 @@ async function _buildPdfTextLayer(page, viewport, canvas) {
   layer.style.height = canvas.height + 'px';
   wrapper.appendChild(layer);
 
+  // Reset span map for TTS word highlighting (rebuilt each page)
+  pdfTtsSpanMap = [];
+  let _spanCharPos = 0;
+
   content.items.forEach(item => {
-    if (!item.str || !item.str.trim()) return;
+    if (!item.str || !item.str.trim()) {
+      _spanCharPos += (item.str ? item.str.length : 0) + 1;
+      return;
+    }
 
     const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
     // CRITICAL: Math.hypot for true font-size, not item.height * viewport.scale
@@ -4172,6 +4245,10 @@ async function _buildPdfTextLayer(page, viewport, canvas) {
         span.style.transform = 'scaleX(' + (spanWidth / textWidth).toFixed(3) + ')';
       }
     }
+
+    // Track char position for TTS highlighting
+    pdfTtsSpanMap.push({ span, start: _spanCharPos, end: _spanCharPos + item.str.length });
+    _spanCharPos += item.str.length + 1; // +1 for joining space
 
     layer.appendChild(span);
   });
@@ -4227,31 +4304,77 @@ async function getPdfPageText(pageNum) {
   } catch(e) { return ''; }
 }
 
+// ── PDF TTS keep-alive (Chrome 15-second pause bug) ──
+function _startPdfTtsKeepAlive() {
+  if (pdfTtsKeepAlive) clearInterval(pdfTtsKeepAlive);
+  pdfTtsKeepAlive = setInterval(() => {
+    if (pdfTtsActive && !pdfTtsPaused && synth.speaking && synth.paused) synth.resume();
+  }, 5000);
+}
+function _stopPdfTtsKeepAlive() {
+  if (pdfTtsKeepAlive) { clearInterval(pdfTtsKeepAlive); pdfTtsKeepAlive = null; }
+}
+
+function _updatePdfPlayPauseBtn() {
+  const btn = document.getElementById('pdf-tts-playpause');
+  const sta = document.getElementById('pdf-tts-status');
+  if (btn) { btn.textContent = pdfTtsPaused ? '▶' : '⏸'; btn.title = pdfTtsPaused ? 'Reanudar' : 'Pausar'; }
+  if (sta) pdfTtsPaused ? sta.classList.add('paused') : sta.classList.remove('paused');
+}
+
+function _pdfTtsHighlight(charIdx) {
+  pdfTtsSpanMap.forEach(s => s.span.classList.remove('pdf-tts-highlight'));
+  let best = null;
+  for (const s of pdfTtsSpanMap) {
+    if (s.start <= charIdx && charIdx < s.end) { best = s; break; }
+    if (s.start > charIdx) { best = s; break; } // nearest-ahead fallback
+  }
+  if (best) {
+    best.span.classList.add('pdf-tts-highlight');
+    // Scroll span into view if needed
+    const wrap = document.getElementById('pdf-canvas-wrap');
+    if (wrap) {
+      const r = best.span.getBoundingClientRect();
+      const w = wrap.getBoundingClientRect();
+      if (r.top < w.top + 40 || r.bottom > w.bottom - 40) {
+        best.span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
+  }
+}
+
 // ── PDF TTS — MUST be synchronous, not async ──
 function startPdfTts() {
   const text = pdfTtsPageTexts[pdfPage];
   if (!text) {
-    // Pre-fetch text then retry — non-blocking
     getPdfPageText(pdfPage).then(t => { if (t && !pdfTtsActive) startPdfTts(); });
     return;
   }
 
   stopPdfTts();
-  pdfTtsActive = true;
+  pdfTtsActive  = true;
+  pdfTtsPaused  = false;
 
   const utt  = new SpeechSynthesisUtterance(text);
   pdfTtsUtterance = utt;
-
   utt.voice  = getVoice('pdf-tts-voice');
   const rng  = document.getElementById('pdf-tts-rate');
   utt.rate   = rng ? parseFloat(rng.value) : 1;
 
-  utt.onend  = () => {
+  // Word highlight via onboundary
+  utt.onboundary = ev => {
     if (pdfTtsUtterance !== utt) return;
-    // Auto-advance to next page
+    if (ev.name && ev.name !== 'word') return;
+    _pdfTtsHighlight(ev.charIndex || 0);
+  };
+
+  utt.onend = () => {
+    if (pdfTtsUtterance !== utt) return;
+    // Clear highlight and auto-advance page (continuous reading)
+    pdfTtsSpanMap.forEach(s => s.span.classList.remove('pdf-tts-highlight'));
     if (pdfDoc && pdfPage < pdfDoc.numPages) {
       pdfPage++;
-      pdfTtsStopOnRender = false;   // Don't stop on auto-advance
+      pdfTtsStopOnRender = false;
       renderPdfPage().then(() => { if (pdfTtsActive) startPdfTts(); });
     } else {
       stopPdfTts();
@@ -4267,22 +4390,39 @@ function startPdfTts() {
   const sta = document.getElementById('pdf-tts-status');
   if (btn) btn.classList.add('active');
   if (bar) bar.style.display = 'flex';
-  if (sta) sta.textContent   = '▶ Leyendo p\u00e1gina ' + pdfPage + '...';
+  if (sta) sta.textContent = 'p. ' + pdfPage;
+  _updatePdfPlayPauseBtn();
+  _startPdfTtsKeepAlive();
 
-  // SYNCHRONOUS — direct call preserves user gesture chain for iOS
   synth.cancel();
   synth.speak(utt);
 }
 
 function stopPdfTts() {
   if (!pdfTtsActive && !pdfTtsUtterance) return;
+  _stopPdfTtsKeepAlive();
   pdfTtsActive    = false;
+  pdfTtsPaused    = false;
   pdfTtsUtterance = null;
   synth.cancel();
+  // Clear any remaining word highlight
+  pdfTtsSpanMap.forEach(s => s.span.classList.remove('pdf-tts-highlight'));
   const btn = document.getElementById('pdf-tts-btn');
-  const sta = document.getElementById('pdf-tts-status');
+  const bar = document.getElementById('pdf-tts-bar');
   if (btn) btn.classList.remove('active');
-  if (sta) sta.textContent = '';
+  if (bar) bar.style.display = 'none';
+}
+
+function togglePdfTtsPause() {
+  if (!pdfTtsActive) return;
+  if (synth.paused) {
+    synth.resume();
+    pdfTtsPaused = false;
+  } else {
+    synth.pause();
+    pdfTtsPaused = true;
+  }
+  _updatePdfPlayPauseBtn();
 }
 
 // Expose
@@ -4363,15 +4503,15 @@ _on('pdf-scroll-toggle', 'click', () => {
   }
 });
 
-_on('pdf-tts-btn',  'click', () => { if (pdfTtsActive) stopPdfTts(); else startPdfTts(); });
-_on('pdf-tts-stop', 'click', stopPdfTts);
+_on('pdf-tts-btn',      'click', () => { if (pdfTtsActive) stopPdfTts(); else startPdfTts(); });
+_on('pdf-tts-stop',     'click', stopPdfTts);
+_on('pdf-tts-playpause','click', togglePdfTtsPause);
 _on('pdf-tts-rate', 'input', e => {
   const lbl = document.getElementById('pdf-tts-rate-lbl');
   if (lbl) lbl.textContent = '×' + parseFloat(e.target.value).toFixed(1);
-  // Restart current page so new rate takes effect immediately
   if (pdfTtsActive) {
     stopPdfTts();
-    setTimeout(startPdfTts, 30);
+    setTimeout(startPdfTts, 50);
   }
 });
 
