@@ -543,19 +543,23 @@
   }
   /* ── Spotlight: dim all words not being read ── */
   #reader-content.tts-active .tts-word {
-    opacity: 0.22;
-    color: var(--reader-muted);
+    opacity: 0.2;
+    transition: opacity 0.1s, background 0.08s, color 0.08s;
   }
   #reader-content.tts-active .tts-word.tts-sentence-active {
-    opacity: 0.6;
+    opacity: 0.78;
     color: var(--reader-text);
-    background: rgba(255,220,60,0.12);
+    background: rgba(200,140,20,0.18);
+    border-radius: 2px;
   }
   #reader-content.tts-active .tts-word.tts-speaking {
     opacity: 1 !important;
-    color: #ffe8a0 !important;
-    background: rgba(255,200,40,0.55) !important;
-    outline: 1.5px solid rgba(230,170,0,0.8) !important;
+    color: #1a0e00 !important;
+    background: #ffd700 !important;
+    border-radius: 3px !important;
+    box-shadow: 0 0 0 2px rgba(255,200,0,0.55), 0 1px 6px rgba(200,140,0,0.5) !important;
+    font-weight: 600 !important;
+    padding: 0 3px !important;
   }
   .tts-word.search-highlight { background: rgba(232,185,106,0.4); border-radius: 2px; }
   .tts-word.search-highlight.search-current { background: rgba(200,137,58,0.7); outline: 1px solid rgba(200,137,58,0.9); }
@@ -3336,6 +3340,28 @@ let _ttsSentences = [], _ttsSentIdx = 0;  // sentence list (full chapter)
 let _ttsChunks = [], _ttsChunkIdx = 0;    // large utterance chunks
 let _ttsKeepAlive = null;                  // Chrome 15-sec bug workaround
 let _readerTtsPaused = false;
+// Word-highlight interval — works even when onboundary doesn't fire
+let _ttsWordHLTimer = null;
+let _ttsLastHLWord  = -1;
+
+function _startTtsWordHL() {
+  _stopTtsWordHL();
+  _ttsLastHLWord = -1;
+  _ttsWordHLTimer = setInterval(() => {
+    if (!readerTtsActive) return;
+    const idx = readerTtsCurrent;
+    if (idx === _ttsLastHLWord) return;
+    if (_ttsLastHLWord >= 0 && _ttsLastHLWord < readerTtsWords.length)
+      readerTtsWords[_ttsLastHLWord].classList.remove('tts-speaking');
+    if (idx >= 0 && idx < readerTtsWords.length)
+      readerTtsWords[idx].classList.add('tts-speaking');
+    _ttsLastHLWord = idx;
+  }, 120);
+}
+function _stopTtsWordHL() {
+  if (_ttsWordHLTimer) { clearInterval(_ttsWordHLTimer); _ttsWordHLTimer = null; }
+  _ttsLastHLWord = -1;
+}
 
 function _clearTtsSentenceHighlight() {
   const rc = document.getElementById('reader-content');
@@ -3459,6 +3485,7 @@ function ttsStopReaderMode() {
   readerTtsActive   = false;
   _readerTtsPaused  = false;
   _stopTtsKeepAlive();
+  _stopTtsWordHL();
   synth.cancel();
   readerTtsCurrent = -1;
   _clearTtsSentenceHighlight();
@@ -3504,6 +3531,7 @@ function startReaderTts() {
   _ttsChunks    = _buildTtsChunks(readerTtsWords, fromWord);
   _ttsChunkIdx  = 0;
   _startTtsKeepAlive();
+  _startTtsWordHL();   // reliable per-word highlight (doesn't need onboundary)
   _speakChunk(0, _readerTtsGen);
 }
 
