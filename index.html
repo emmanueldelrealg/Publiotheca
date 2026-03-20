@@ -740,8 +740,13 @@
   /* Dim the overall PDF canvas area when TTS is active */
   #pdf-canvas-wrap.tts-active #pdf-canvas,
   #pdf-canvas-wrap.tts-active .pdf-page-wrapper canvas {
-    filter: brightness(0.55);
+    filter: brightness(0.45);
     transition: filter 0.2s;
+  }
+  /* The text layer is invisible by default (opacity:0.001); make it visible
+     when TTS is active so .pdf-tts-highlight can show through the dimmed canvas */
+  #pdf-canvas-wrap.tts-active .pdf-text-layer {
+    opacity: 1;
   }
   #pdf-canvas-wrap {
     flex: 1; overflow: auto;
@@ -1825,6 +1830,24 @@ let pdfTtsPaused      = false;
 let pdfTtsSpanMap     = [];   // [{span, start, end}] rebuilt each page render
 let pdfTtsKeepAlive   = null;
 let pdfTtsCharIdx     = 0;    // last charIndex from onboundary (absolute in page text)
+let _pdfTtsHLTimer    = null; // fallback highlight timer (when onboundary doesn't fire)
+
+function _startPdfTtsHL(text, charOffset, rate, utt) {
+  _stopPdfTtsHL();
+  const charsPerMs = (14 * rate) / 1000;   // ~14 chars/sec at rate=1
+  const start      = Date.now();
+  _pdfTtsHLTimer = setInterval(() => {
+    if (!pdfTtsActive || pdfTtsUtterance !== utt) { _stopPdfTtsHL(); return; }
+    if (pdfTtsPaused) return;
+    const expected = charOffset + Math.floor((Date.now() - start) * charsPerMs);
+    const clamped  = Math.min(expected, charOffset + text.length - 1);
+    pdfTtsCharIdx  = clamped;
+    _pdfTtsHighlight(clamped);
+  }, 220);
+}
+function _stopPdfTtsHL() {
+  if (_pdfTtsHLTimer) { clearInterval(_pdfTtsHLTimer); _pdfTtsHLTimer = null; }
+}
 
 // RSVP state
 let _timerGeneration = 0;
@@ -3560,7 +3583,9 @@ function _speakChunk(chunkIdx, gen) {
   let _lastScrollTime = 0;
   utt.onboundary = ev => {
     if (gen !== _readerTtsGen || ev.name !== 'word') return;
-    boundaryFired = true;
+    // Only trust onboundary once charIndex has actually advanced (charIndex=0 always
+    // means the browser fires the event but doesn't report real positions)
+    if (ev.charIndex > 0) boundaryFired = true;
     const charIdx  = ev.charIndex || 0;
     const spoken   = charIdx > 0 ? chunk.text.slice(0, charIdx).trim() : '';
     const wLocal   = spoken ? spoken.split(/\s+/).length : 0;
@@ -4459,13 +4484,23 @@ function startPdfTts(fromChar) {
   const rng  = document.getElementById('pdf-tts-rate');
   utt.rate   = rng ? parseFloat(rng.value) : 1;
 
-  // Word highlight via onboundary
+  // Word highlight via onboundary; fallback timer starts if charIndex never advances
+  let _pdfBoundaryFired = false;
   utt.onboundary = ev => {
     if (pdfTtsUtterance !== utt) return;
     if (ev.name && ev.name !== 'word') return;
+    if (ev.charIndex > 0) {          // charIndex>0 = browser is reporting real positions
+      _pdfBoundaryFired = true;
+      _stopPdfTtsHL();               // let onboundary take over; cancel fallback timer
+    }
     pdfTtsCharIdx = charOffset + (ev.charIndex || 0);
     _pdfTtsHighlight(pdfTtsCharIdx);
   };
+  // Start fallback timer; if onboundary fires with charIndex>0 it cancels the timer
+  setTimeout(() => {
+    if (pdfTtsActive && pdfTtsUtterance === utt && !_pdfBoundaryFired)
+      _startPdfTtsHL(text, charOffset, utt.rate, utt);
+  }, 600);
 
   utt.onend = () => {
     if (pdfTtsUtterance !== utt) return;
@@ -4538,6 +4573,7 @@ function jumpPdfTtsWords(delta) {
 function stopPdfTts() {
   if (!pdfTtsActive && !pdfTtsUtterance) return;
   _stopPdfTtsKeepAlive();
+  _stopPdfTtsHL();
   pdfTtsActive    = false;
   pdfTtsPaused    = false;
   pdfTtsUtterance = null;
