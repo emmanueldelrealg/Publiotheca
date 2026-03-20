@@ -531,7 +531,7 @@
   #reader-content a { color: var(--amber); }
   .search-highlight { background: rgba(232,185,106,0.3); border-radius: 2px; }
   .search-highlight.current { background: rgba(200,137,58,0.6); }
-  .tts-word { border-radius: 2px; padding: 0 1px; cursor: default; transition: background 0.1s; }
+  .tts-word { border-radius: 2px; padding: 0 1px; cursor: default; transition: background 0.1s, opacity 0.15s, color 0.15s; }
   .tts-word.tts-sentence-active {
     background: rgba(255,220,60,0.22);
     border-radius: 2px;
@@ -540,6 +540,22 @@
     background: rgba(255,200,40,0.5);
     outline: 1.5px solid rgba(230,170,0,0.7);
     border-radius: 2px;
+  }
+  /* ── Spotlight: dim all words not being read ── */
+  #reader-content.tts-active .tts-word {
+    opacity: 0.22;
+    color: var(--reader-muted);
+  }
+  #reader-content.tts-active .tts-word.tts-sentence-active {
+    opacity: 0.6;
+    color: var(--reader-text);
+    background: rgba(255,220,60,0.12);
+  }
+  #reader-content.tts-active .tts-word.tts-speaking {
+    opacity: 1 !important;
+    color: #ffe8a0 !important;
+    background: rgba(255,200,40,0.55) !important;
+    outline: 1.5px solid rgba(230,170,0,0.8) !important;
   }
   .tts-word.search-highlight { background: rgba(232,185,106,0.4); border-radius: 2px; }
   .tts-word.search-highlight.search-current { background: rgba(200,137,58,0.7); outline: 1px solid rgba(200,137,58,0.9); }
@@ -710,10 +726,18 @@
   /* PDF read-aloud word highlight — makes invisible span text visible + colored */
   .pdf-tts-highlight {
     color: #1a1a1a !important;
-    background: rgba(255, 215, 50, 0.88) !important;
+    background: rgba(255, 215, 50, 0.92) !important;
     border-radius: 2px;
     opacity: 1 !important;
-    transition: background 0.1s;
+    outline: 2px solid rgba(230,170,0,0.8) !important;
+    transition: background 0.08s;
+    box-shadow: 0 0 0 3px rgba(255,215,50,0.25);
+  }
+  /* Dim the overall PDF canvas area when TTS is active */
+  #pdf-canvas-wrap.tts-active #pdf-canvas,
+  #pdf-canvas-wrap.tts-active .pdf-page-wrapper canvas {
+    filter: brightness(0.55);
+    transition: filter 0.2s;
   }
   #pdf-canvas-wrap {
     flex: 1; overflow: auto;
@@ -3392,6 +3416,19 @@ function _updateTtsPlayPauseBtn() {
   btn.title       = _readerTtsPaused ? 'Reanudar' : 'Pausar';
 }
 
+// Smooth scroll inside #reader-content to bring el into the upper-mid viewport area
+function _scrollReaderToEl(el) {
+  const rc = document.getElementById('reader-content');
+  if (!rc || !el) return;
+  const elTop  = el.offsetTop;
+  const rcTop  = rc.scrollTop;
+  const rcH    = rc.clientHeight;
+  // Scroll if element is below 65% of viewport or above top + 80px
+  if (elTop > rcTop + rcH * 0.65 || elTop < rcTop + 80) {
+    rc.scrollTo({ top: Math.max(0, elTop - rcH * 0.32), behavior: 'smooth' });
+  }
+}
+
 function _highlightTtsSentence(sentIdx) {
   _clearTtsSentenceHighlight();
   if (sentIdx < 0 || sentIdx >= _ttsSentences.length) return;
@@ -3399,9 +3436,9 @@ function _highlightTtsSentence(sentIdx) {
   for (let i = s.start; i < s.end && i < readerTtsWords.length; i++) {
     readerTtsWords[i].classList.add('tts-sentence-active');
   }
-  // Scroll the sentence into view (only if needed)
+  // Scroll to keep sentence in view
   const firstEl = readerTtsWords[s.start];
-  if (firstEl) firstEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  _scrollReaderToEl(firstEl);
 }
 
 function _sentenceForWord(wi) {
@@ -3429,6 +3466,9 @@ function ttsStopReaderMode() {
   const bar = document.getElementById('reader-tts-bar');
   if (btn) btn.classList.remove('active');
   if (bar) bar.style.display = 'none';
+  // Remove spotlight mode
+  const rc = document.getElementById('reader-content');
+  if (rc) rc.classList.remove('tts-active');
 }
 
 // ── Start reader TTS ──
@@ -3441,6 +3481,9 @@ function startReaderTts() {
   readerTtsActive  = true;
   _readerTtsPaused = false;
   readerTtsCurrent = 0;
+
+  // Activate spotlight mode
+  rc.classList.add('tts-active');
 
   const bar = document.getElementById('reader-tts-bar');
   if (bar) bar.style.display = 'flex';
@@ -3484,8 +3527,9 @@ function _speakChunk(chunkIdx, gen) {
   utt.rate  = rate;
   utt.voice = getVoice('reader-tts-voice');
 
-  // onboundary: track current word → update sentence highlight when sentence changes
+  // onboundary: track current word → update sentence highlight + auto-scroll
   let boundaryFired = false;
+  let _lastScrollTime = 0;
   utt.onboundary = ev => {
     if (gen !== _readerTtsGen || ev.name !== 'word') return;
     boundaryFired = true;
@@ -3502,26 +3546,23 @@ function _speakChunk(chunkIdx, gen) {
     const curEl = readerTtsWords[readerTtsCurrent];
     if (curEl) curEl.classList.add('tts-speaking');
 
+    // Auto-scroll: keep current word visible (throttle to avoid jitter)
+    if (curEl) {
+      const now = Date.now();
+      if (now - _lastScrollTime > 700) {
+        _lastScrollTime = now;
+        _scrollReaderToEl(curEl);
+      }
+    }
+
     // Switch sentence highlight when we enter a new sentence
     const s = _sentenceForWord(readerTtsCurrent);
     if (s >= 0 && s !== _ttsSentIdx) {
       _ttsSentIdx = s;
-      // Highlight new sentence without scrolling (already in view)
       readerTtsWords.forEach(w => w.classList.remove('tts-sentence-active'));
       const sent = _ttsSentences[s];
       for (let i = sent.start; i < sent.end && i < readerTtsWords.length; i++) {
         readerTtsWords[i].classList.add('tts-sentence-active');
-      }
-      // Scroll only if sentence is not visible
-      const el = readerTtsWords[sent.start];
-      if (el) {
-        const rc = document.getElementById('reader-content');
-        if (rc) {
-          const elTop = el.offsetTop, rcTop = rc.scrollTop, rcH = rc.clientHeight;
-          if (elTop < rcTop + 60 || elTop > rcTop + rcH - 60) {
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }
       }
     }
   };
@@ -4354,13 +4395,15 @@ function _pdfTtsHighlight(charIdx) {
   }
   if (best) {
     best.span.classList.add('pdf-tts-highlight');
-    // Scroll span into view if needed
+    // Auto-scroll: keep highlighted word in upper-mid of pdf-canvas-wrap
     const wrap = document.getElementById('pdf-canvas-wrap');
     if (wrap) {
       const r = best.span.getBoundingClientRect();
       const w = wrap.getBoundingClientRect();
-      if (r.top < w.top + 40 || r.bottom > w.bottom - 40) {
-        best.span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const relTop = r.top - w.top + wrap.scrollTop;
+      const wrapH  = wrap.clientHeight;
+      if (r.top < w.top + 80 || r.bottom > w.bottom - 80) {
+        wrap.scrollTo({ top: Math.max(0, relTop - wrapH * 0.35), behavior: 'smooth' });
       }
     }
   }
@@ -4413,12 +4456,14 @@ function startPdfTts(fromChar) {
     stopPdfTts();
   };
 
-  const btn = document.getElementById('pdf-tts-btn');
-  const bar = document.getElementById('pdf-tts-bar');
-  const sta = document.getElementById('pdf-tts-status');
-  if (btn) btn.classList.add('active');
-  if (bar) bar.style.display = 'flex';
-  if (sta) sta.textContent = 'p. ' + pdfPage;
+  const btn  = document.getElementById('pdf-tts-btn');
+  const bar  = document.getElementById('pdf-tts-bar');
+  const sta  = document.getElementById('pdf-tts-status');
+  const wrap = document.getElementById('pdf-canvas-wrap');
+  if (btn)  btn.classList.add('active');
+  if (bar)  bar.style.display = 'flex';
+  if (sta)  sta.textContent = 'p. ' + pdfPage;
+  if (wrap) wrap.classList.add('tts-active');
   _updatePdfPlayPauseBtn();
   _startPdfTtsKeepAlive();
 
@@ -4471,10 +4516,12 @@ function stopPdfTts() {
   synth.cancel();
   // Clear any remaining word highlight
   pdfTtsSpanMap.forEach(s => s.span.classList.remove('pdf-tts-highlight'));
-  const btn = document.getElementById('pdf-tts-btn');
-  const bar = document.getElementById('pdf-tts-bar');
-  if (btn) btn.classList.remove('active');
-  if (bar) bar.style.display = 'none';
+  const btn  = document.getElementById('pdf-tts-btn');
+  const bar  = document.getElementById('pdf-tts-bar');
+  const wrap = document.getElementById('pdf-canvas-wrap');
+  if (btn)  btn.classList.remove('active');
+  if (bar)  bar.style.display = 'none';
+  if (wrap) wrap.classList.remove('tts-active');
 }
 
 function togglePdfTtsPause() {
